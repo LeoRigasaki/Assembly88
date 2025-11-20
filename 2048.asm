@@ -1,6 +1,19 @@
+%assign VIDEO_MEM 0xb800
+%assign ROW_SIZE 160
+%assign COL_SIZE 2
+
 [org 0x0100]
-							; call the text for the text mode as well enter in mainloop for grid build
-jmp text
+start_game:
+    ; Reset Score
+    mov word [score], 0
+    
+    ; Reset Board
+    mov cx, 16
+    mov di, board
+    xor al, al
+    rep stosb
+    
+	jmp text
 
 clsclr:
 	push es 
@@ -86,29 +99,42 @@ buildgrid:
     mov word [cell_ptr], board
     call add_new_cell
     call print_board
+    call print_score
 check_input:
     mov ah, 0                   
     int 0x16                    ;BIOS service for keyboard
 
-    cmp ah, 0x48                ;up
+    cmp ah, 0x48                ; Up Arrow
+    je goup
+    cmp ah, 0x11                ; W key
     je goup
 	
-    cmp ah, 0x50                ;down
+    cmp ah, 0x50                ; Down Arrow
+    je godown
+    cmp ah, 0x1F                ; S key
     je godown
 	
-    cmp ah, 0x4d                ; right
+    cmp ah, 0x4d                ; Right Arrow
+    je goright
+    cmp ah, 0x20                ; D key
     je goright
 	
-	cmp ah, 0x4b                ;left
+	cmp ah, 0x4b                ; Left Arrow
+    je goleft
+    cmp ah, 0x1E                ; A key
     je goleft
 
-    cmp ah, 0x1                 ; We need it to exit the game
+    cmp al, 'r'                 ; R key for Restart
+    je start_game
+    cmp al, 'R'
+    je start_game
+
+    cmp ah, 0x1                 ; Esc to exit
     jne check_input
     jmp exit
 
 goleft:
     mov bp, move_left
-    jmp do_movement
 goright:
     mov bp, move_right
     jmp do_movement
@@ -121,8 +147,10 @@ do_movement:
     mov al, byte [bp]
     cbw
     mov word [curr_off], ax
-    mov ax, board
-    add al, byte [bp+1]
+    
+    mov al, byte [bp+1]
+    cbw
+    add ax, board       ; Add to board address (16-bit add)
     xor dx, dx
     mov dl, byte [bp+2]
     call compute_movement
@@ -131,7 +159,120 @@ do_movement:
     call system_time
 %endif
 
+    call check_win
+    call check_loss
     jmp buildgrid
+
+check_win:
+    mov cx, 16
+    mov si, board
+check_win_loop:
+    lodsb
+    cmp al, 11 ; 2048 tile (2^11)
+    je win_screen
+    loop check_win_loop
+    ret
+
+check_loss:
+    ; 1. Check for empty cells
+    mov cx, 16
+    mov si, board
+check_empty_loop:
+    lodsb
+    cmp al, 0
+    je not_loss ; Found empty cell, game continues
+    loop check_empty_loop
+
+    ; 2. Check Horizontal Merges
+    ; Rows: 0,1,2,3; 4,5,6,7; etc.
+    ; Check indices 0,1,2 (skip last in row)
+    mov cx, 4 ; 4 rows
+    mov bx, 0 ; Row start index
+row_check_outer:
+    push cx
+    mov cx, 3 ; 3 pairs per row
+    mov si, board
+    add si, bx
+row_check_inner:
+    lodsb       ; Load current
+    mov ah, al
+    mov al, [si] ; Load next (si already incremented by lodsb)
+    cmp ah, al
+    je not_loss_pop ; Found match
+    loop row_check_inner
+    
+    add bx, 4 ; Next row
+    pop cx
+    loop row_check_outer
+
+    ; 3. Check Vertical Merges
+    ; Cols: 0,4,8,12; 1,5,9,13; etc.
+    ; Check indices 0,4,8 (skip last in col)
+    mov cx, 4 ; 4 cols
+    mov bx, 0 ; Col start index
+col_check_outer:
+    push cx
+    mov cx, 3 ; 3 pairs per col
+    mov si, board
+    add si, bx
+col_check_inner:
+    lodsb       ; Load current
+    mov ah, al
+    ; Next is at si + 3 (since lodsb moved 1, need +3 to get +4 total)
+    mov al, [si+3] 
+    cmp ah, al
+    je not_loss_pop ; Found match
+    
+    add si, 3 ; Move to next in col (si is at i+1, need i+4, so +3)
+    loop col_check_inner
+    
+    inc bx ; Next col
+    pop cx
+    loop col_check_outer
+    
+    ; If we get here, NO moves possible.
+    jmp loss_screen
+
+not_loss_pop:
+    pop cx
+not_loss:
+    ret
+
+loss_screen:
+    call clsclr
+    mov ah, 0x13
+    mov al, 1
+    mov bh, 0
+    mov bl, 0x04 ; Red
+    mov dx, 0x0C20 ; Center screen
+    mov cx, 9
+    push cs
+    pop es
+    mov bp, str_loss
+    int 0x10
+    
+    ; Wait for key to restart
+    mov ah, 0
+    int 0x16
+    jmp start_game
+
+win_screen:
+    call clsclr
+    mov ah, 0x13
+    mov al, 1
+    mov bh, 0
+    mov bl, 0x0E ; Yellow
+    mov dx, 0x0C20 ; Center screen
+    mov cx, 8
+    push cs
+    pop es
+    mov bp, str_win
+    int 0x10
+    
+    ; Wait for key to restart
+    mov ah, 0
+    int 0x16
+    jmp start_game
 
 
 %ifdef dos
@@ -251,12 +392,12 @@ _skip_move:
     dec bx			;Ignoring the cell with diff val
     cmp bx, 0
     jne _move_find
+    jmp _return     ; If no non-zero value found, skip merge
  _add:
     mov bx, cx
     mov bp, [cell_ptr]
 
-add
-_find:
+add_find:
     add bp, [curr_off]
     mov dl, byte [bp]
     cmp dl, 0
@@ -266,6 +407,14 @@ _find:
     mov byte [bp], 0
     mov bp, [cell_ptr]
     inc byte [bp]
+    
+    ; Update Score
+    pusha
+    mov cl, byte [bp] ; The new exponent value
+    mov ax, 1
+    shl ax, cl        ; Calculate 2^cl
+    add [score], ax   ; Add to score
+    popa
 
     jmp _return
 
@@ -282,7 +431,7 @@ _return:
 	
     ; Printing the board function
 print_board:
-    mov cx, 17                          
+    mov cx, 16                          
 _loop_cell:
     pusha                               
     mov al, cl                          
@@ -447,3 +596,51 @@ board:
 
 str0:db 'Name: Sohaib Ahmed'
 str1:db 'retro 2048'
+str_win: db 'YOU WIN!'
+str_loss: db 'GAME OVER'
+str_score: db 'Score: '
+score: dw 0
+
+print_score:
+    push es
+    pusha
+    mov ax, 0xb800
+    mov es, ax
+    
+    ; Print "Score: "
+    mov di, 160*2 + 10 ; Row 2, slightly indented
+    mov si, str_score
+    mov cx, 7
+    mov ah, 0x1E       ; Yellow on Blue
+print_score_label:
+    lodsb
+    stosw
+    loop print_score_label
+    
+    ; Print Score Value
+    mov ax, [score]
+    call print_number_at
+    
+    popa
+    pop es
+    ret
+
+; Print number in AX at DI
+print_number_at:
+    mov bx, 10
+    xor cx, cx
+get_digits:
+    xor dx, dx
+    div bx
+    push dx
+    inc cx
+    cmp ax, 0
+    jne get_digits
+    
+print_digits:
+    pop ax
+    add al, '0'
+    mov ah, 0x1E
+    stosw
+    loop print_digits
+    ret
